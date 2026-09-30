@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oddballz Music Lab</title>
+<!--
+  Oddballz music lab: plays a song from songs/*.js the way the C64 will.
+
+  The player below runs at 50 Hz and produces, each frame, exactly what a C64
+  player writes to the SID: per voice a 16-bit frequency, a 12-bit pulse width,
+  a waveform, the gate and ADSR; and the filter's cutoff, resonance, mode and
+  routing. The synth then renders those registers: SID oscillators (24-bit
+  accumulator at the PAL clock, the 23-bit noise LFSR), the SID's envelope
+  rates with its exponential decay, and a resonant filter. So the port is a
+  translation of the song data and the player, not a re-arrangement.
+
+  Not emulated: combined waveforms, ring mod, sync, the ADSR delay bug (the
+  player's hard restart avoids it anyway), the 6581's filter curve.
+
+  No libraries, no network. Open the file directly.
+-->
+<style>
+  :root {
+    --bg: #0e0f14; --panel: #171922; --line: #2a2d3a; --text: #e6e6ec; --dim: #8b8fa3;
+    --v1: #ffb347; --v2: #4fd1e8; --v3: #b18cff; --drum: #9aa0b4; --accent: #7ee787;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
+  header { padding: 14px 16px 6px; display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: baseline; }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .sub { color: var(--dim); font-size: 13px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 16px; }
+  button, select { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+         border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:hover { border-color: #444a60; }
+  button.primary { background: #233a2a; border-color: #2f5a3a; min-width: 84px; }
+  .chip { padding: 4px 10px; font-size: 13px; }
+  .chip.on { border-color: var(--accent); color: var(--accent); }
+  .song { padding: 8px 16px; font-weight: 600; }
+  .song.on { background: #2a2350; border-color: var(--v3); color: #fff; }
+  label.mute { display: inline-flex; gap: 6px; align-items: center; padding: 4px 10px;
+         border: 1px solid var(--line); border-radius: 6px; cursor: pointer; user-select: none; font-size: 13px; }
+  label.mute input { margin: 0; }
+  .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  #pos { font-variant-numeric: tabular-nums; color: var(--dim); margin-left: auto; font-size: 13px; }
+  #pos b { color: var(--text); font-weight: 600; }
+  .roll { padding: 4px 16px 0; }
+  canvas { width: 100%; height: 380px; display: block; background: #0b0c10;
+           border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+  #err { color: #ff7b72; padding: 0 16px; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .foot { color: var(--dim); font-size: 12px; padding: 8px 16px 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Oddballz Music Lab</h1>
+  <span class="sub" id="songinfo"></span>
+</header>
+<div class="bar">
+  <button class="primary" id="play">&#9654; Play</button>
+  <button id="restart">&#8634; From start</button>
+  <span id="pos"></span>
+</div>
+<div class="bar" id="songbar"></div>
+<div class="bar" id="sections"></div>
+<div class="bar">
+  <label class="mute"><input type="checkbox" data-v="0" checked><span class="sw" style="background:var(--v1)"></span>Lead (v1)</label>
+  <label class="mute"><input type="checkbox" data-v="1" checked><span class="sw" style="background:var(--v2)"></span>Bass + drums (v2)</label>
+  <label class="mute"><input type="checkbox" data-v="2" checked><span class="sw" style="background:var(--v3)"></span>Chords (v3, the effects voice)</label>
+  <label class="mute" title="Plays the song through the C64 player's own arithmetic (c64.js): vibrato, glides and sweeps as the port does them"><input type="checkbox" id="c64mode"><span class="sw" style="background:var(--accent)"></span>Play as the C64 does</label>
+</div>
+<div class="roll"><canvas id="roll"></canvas></div>
+<div id="err"></div>
+<div class="foot">Click the roll to jump there. Bar numbers are what to quote in feedback ("bar 14, the lead is too high").
+  Untick v3 to hear the tune as it plays while a sound effect has the third voice.</div>
+
+<!-- the title, then one per background picture, in the game's order: bg0-bg3 -->
+<script src="c64.js"></script>
+<script src="songs/title.js"></script>
+<script src="songs/nebula.js"></script>
+<script src="songs/cyber.js"></script>
+<script src="songs/hyperspace.js"></script>
+<script src="songs/mothership.js"></script>
+<script>
+'use strict';
+
+const PAL_CLOCK = 985248, FRAME_HZ = 50;
+const FREQ_MUL = 16777216 / PAL_CLOCK;           // Hz -> SID frequency register
+
+/* ---------- song parsing ------------------------------------------------ */
+
+const NOTE_RE = /^([>\/]?)([A-G])([#b]?)(-?\d)((?::\w+|~[0-9a-fA-F]+)*)$/;
+const SEMI = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+
+function noteMidi(name) {
+  const m = /^([A-G])([#b]?)(-?\d)$/.exec(name);
+  if (!m) throw new Error('bad note ' + name);
+  return 12 * (+m[3] + 1) + SEMI[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0);
+}
+
+function parseToken(tok, song) {
+  if (tok === '.') return null;
+  if (tok === '^') return { off: true };
+  if (song.drums[tok]) return { drum: song.drums[tok] };
+  const m = NOTE_RE.exec(tok);
+  if (!m) throw new Error('bad token "' + tok + '"');
+  const ev = { midi: noteMidi(m[2] + m[3] + m[4]), glide: m[1] === '>', legato: m[1] === '/' };
+  for (const s of m[5].match(/:\w+|~[0-9a-fA-F]+/g) || []) {
+    if (s[0] === ':') ev.inst = s.slice(1);
+    else ev.arp = [...s.slice(1)].map(c => parseInt(c, 16));
+  }
+  return ev;
+}
+
+// Flattens the song into one row list per voice, playing the order once and
+// then the loop part once more, so the loop can be rendered with a real tail.
+function flatten(song) {
+  const pats = {};
+  for (const [k, v] of Object.entries(song.patterns)) {
+    pats[k] = v.split(/\s+/).filter(t => t && t !== '|');
+    if (pats[k].length % song.rowsPerBar)
+      throw new Error('pattern ' + k + ': ' + pats[k].length + ' rows, not whole bars of ' + song.rowsPerBar);
+  }
+  const loopIdx = song.order.indexOf(song.loopTo);
+  if (loopIdx < 0) throw new Error('loopTo "' + song.loopTo + '" is not in order');
+  const seq = [...song.order, ...song.order.slice(loopIdx)];
+  const voices = [[], [], []], rowInfo = [], secSpans = [];
+  let barNo = 0, firstPassRows = 0, loopStartRow = 0;
+  const barOfRow = {};                      // first-pass row -> bar number, for pass 2
+  seq.forEach((secName, si) => {
+    const sec = song.sections[secName];
+    if (!sec) throw new Error('no section "' + secName + '"');
+    const start = voices[0].length;
+    const lens = [];
+    ['v1', 'v2', 'v3'].forEach((vk, v) => {
+      let n = 0;
+      for (const entry of sec[vk]) {
+        const m = /^(\w+)([+-]\d+)?(?:@(\w+))?$/.exec(entry);
+        if (!m || !pats[m[1]]) throw new Error(secName + '.' + vk + ': no pattern "' + entry + '"');
+        const tr = m[2] ? +m[2] : 0;
+        pats[m[1]].forEach((tok, i) => {
+          voices[v].push({ ev: parseToken(tok, song), tr, setInst: i === 0 ? m[3] : undefined });
+          n++;
+        });
+      }
+      lens.push(n);
+    });
+    if (lens[0] !== lens[1] || lens[1] !== lens[2])
+      throw new Error('section ' + secName + ': voices have ' + lens.join(' / ') + ' rows');
+    if (si === song.order.length) loopStartRow = start;
+    const pass2 = si >= song.order.length;
+    const secFirstPassStart = pass2 ? secSpans.find(s => s.name === secName && !s.pass2).start : start;
+    for (let r = 0; r < lens[0]; r++) {
+      const bar = pass2 ? barOfRow[secFirstPassStart + r] : (barNo + Math.floor(r / song.rowsPerBar) + 1);
+      if (!pass2) barOfRow[start + r] = bar;
+      rowInfo.push({ sec: secName, bar, barInSec: Math.floor(r / song.rowsPerBar) + 1 });
+    }
+    secSpans.push({ name: secName, start, rows: lens[0], pass2 });
+    if (!pass2) { barNo += Math.ceil(lens[0] / song.rowsPerBar); firstPassRows = start + lens[0]; }
+  });
+  return { voices, rowInfo, secSpans, totalRows: voices[0].length, loopStartRow, firstPassRows, bars: barNo };
+}
+
+/* ---------- player: song rows -> SID registers, one frame at a time ----- */
+
+const midiToReg = m => Math.max(0, Math.min(65535, Math.round(440 * Math.pow(2, (m - 69) / 12) * FREQ_MUL)));
+
+function play(song, flat) {
+  const frames = [];                          // per frame: { v: [3 voice regs], filt, vis: [3] }
+  const st = [0, 1, 2].map(() => ({ sticky: null, inst: null, pitch: 60, target: 60, arp: null,
+    frame: 0, pw: 0x800, pdir: 1, gate: false, adsr: [0, 0, 0, 0], hr: false, drum: false, playing: false }));
+  const filt = { owner: -1, cutoff: 0x7FF, dir: 1, res: 0, mode: 'LP', inst: null };
+  const inst = name => { const i = song.instruments[name]; if (!i) throw new Error('no instrument "' + name + '"'); return i; };
+
+  for (let r = 0; r < flat.totalRows; r++) {
+    for (let f = 0; f < song.speed; f++) {
+      if (f === 0) for (let v = 0; v < 3; v++) {
+        const row = flat.voices[v][r], s = st[v];
+        if (row.setInst) s.sticky = row.setInst;
+        const ev = row.ev;
+        if (!ev) continue;
+        if (ev.off) { s.gate = false; continue; }
+        s.hr = false;
+        if (ev.drum) {
+          s.inst = inst(ev.drum); s.drum = true; s.arp = null; s.pitch = s.target = 60;
+        } else {
+          if (ev.inst) s.sticky = ev.inst;
+          if (!s.sticky) throw new Error('voice ' + (v + 1) + ' row ' + r + ': note with no instrument');
+          const note = ev.midi + row.tr;
+          s.drum = false;
+          if ((ev.glide || ev.legato) && s.playing) {
+            s.target = note; if (ev.legato) s.pitch = note;
+            s.arp = ev.arp || s.inst.arp || null;
+            continue;                           // no retrigger
+          }
+          s.inst = inst(s.sticky); s.pitch = s.target = note;
+          s.arp = ev.arp || s.inst.arp || null;
+        }
+        s.frame = 0; s.gate = true; s.playing = true; s.adsr = s.inst.adsr;
+        const p = s.inst.pulse || [0x800, 0, 0x800, 0x800];
+        s.pw = p[0]; s.pdir = 1;
+        if (s.inst.filter) {
+          const Fi = s.inst.filter;
+          if (!(Fi.keep && filt.inst === Fi)) { filt.cutoff = Fi.cutoff[0]; filt.dir = 1; }
+          filt.owner = v; filt.inst = Fi; filt.res = Fi.res; filt.mode = Fi.mode;
+        } else if (filt.owner === v) filt.owner = -1;
+      }
+      // hard restart: two frames before a fresh note, gate off with a fast release
+      if (f === song.speed - 2 && r + 1 < flat.totalRows) for (let v = 0; v < 3; v++) {
+        const nx = flat.voices[v][r + 1].ev;
+        if (nx && !nx.off && (nx.drum || !(nx.glide || nx.legato))) { st[v].gate = false; st[v].hr = true; }
+      }
+
+      const out = { v: [], filt: null, vis: [] };
+      for (let v = 0; v < 3; v++) {
+        const s = st[v], I = s.inst;
+        if (!I) { out.v.push({ freq: 0, pw: 0, wf: '-', gate: false, adsr: [0, 0, 0, 0] }); out.vis.push(null); continue; }
+        const W = I.wave, n = W.length;
+        let wi = s.frame < n ? s.frame : (I.loop != null ? I.loop + (s.frame - n) % (n - I.loop) : n - 1);
+        const [wf, pv] = W[wi];
+        if (s.target !== s.pitch) {             // glide
+          const g = I.glide || 0.5, d = s.target - s.pitch;
+          s.pitch = Math.abs(d) <= g ? s.target : s.pitch + Math.sign(d) * g;
+        }
+        let note;
+        if (typeof pv === 'string') note = noteMidi(pv.slice(1));
+        else {
+          note = s.pitch + pv;
+          if (s.arp) note += s.arp[Math.floor(s.frame / (I.arpSpeed || 1)) % s.arp.length];
+          if (I.vib && s.frame >= I.vib[0]) {
+            const t = ((s.frame - I.vib[0]) % I.vib[2]) / I.vib[2];
+            note += I.vib[1] * (t < 0.25 ? 4 * t : t < 0.75 ? 2 - 4 * t : 4 * t - 4);
+          }
+        }
+        if (I.pulse) {
+          const [, sp, lo, hi] = I.pulse;
+          s.pw += s.pdir * sp;
+          if (s.pw >= hi) { s.pw = hi; s.pdir = -1; } else if (s.pw <= lo) { s.pw = lo; s.pdir = 1; }
+        }
+        out.v.push({ freq: midiToReg(note), pw: s.pw & 0xFFF, wf, gate: s.gate,
+                     adsr: s.hr ? [0, 0, 0, 0] : s.adsr });
+        out.vis.push(s.playing ? { pitch: s.pitch, drum: s.drum, arp: s.arp, gate: s.gate } : null);
+        s.frame++;
+      }
+      if (filt.owner >= 0) {
+        const c = filt.inst.cutoff;
+        let nc = filt.cutoff + filt.dir * c[1];
+        if (filt.inst.bounce && (nc >= c[3] || nc <= c[2])) filt.dir = -filt.dir;
+        filt.cutoff = Math.max(c[2], Math.min(c[3], nc));
+        out.filt = { cutoff: filt.cutoff, res: filt.res, mode: filt.mode, voice: filt.owner };
+      }
+      frames.push(out);
+    }
+  }
+  return frames;
+}
+
+/* ---------- SID-style synth: registers -> samples ----------------------- */
+
+const RATE = [9, 32, 63, 95, 149, 220, 267, 313, 392, 977, 1954, 3126, 3907, 11720, 19532, 31251];
+const expDiv = l => l >= 93 ? 1 : l >= 54 ? 2 : l >= 26 ? 4 : l >= 14 ? 8 : l >= 6 ? 16 : 30;
+
+function blep(t, dt) {
+  if (t < dt) { t /= dt; return t + t - t * t - 1; }
+  if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+  return 0;
+}
+
+function render(frames, sr, mute) {
+  const spf = sr / FRAME_HZ, cps = PAL_CLOCK / sr;
+  const N = Math.round(frames.length * spf);
+  const buf = new Float32Array(N);
+  const vs = [0, 1, 2].map(() => ({ acc: 0, lfsr: 0x7FFFF8, nout: 0, env: 0, st: 'rel', ecnt: 0, gate: false }));
+  let low = 0, band = 0, dcx = 0, dcy = 0, idx = 0, peak = 0;
+  for (let fi = 0; fi < frames.length; fi++) {
+    const F = frames[fi];
+    const end = Math.round((fi + 1) * spf);
+    for (let v = 0; v < 3; v++) {
+      const R = F.v[v], s = vs[v];
+      if (R.gate && !s.gate) { s.st = 'att'; }
+      if (!R.gate && s.gate) { s.st = 'rel'; }
+      s.gate = R.gate;
+    }
+    const fl = F.filt;
+    let ff = 0, fq = 1, fmode = 0, fvoice = -1;
+    if (fl) {
+      const hz = Math.min(12500, 30 + fl.cutoff * 5.86);
+      ff = Math.min(1.2, 2 * Math.sin(Math.PI * hz / (2 * sr)));
+      fq = 1.4 - fl.res * 0.075;
+      fmode = fl.mode; fvoice = fl.voice;
+    }
+    for (; idx < end; idx++) {
+      let direct = 0, filtIn = 0;
+      for (let v = 0; v < 3; v++) {
+        const R = F.v[v], s = vs[v];
+        // envelope, stepped at the SID's own rates
+        s.ecnt += cps;
+        if (s.st === 'att') {
+          const p = RATE[R.adsr[0]];
+          while (s.ecnt >= p) { s.ecnt -= p; if (++s.env >= 255) { s.env = 255; s.st = 'dec'; break; } }
+        } else {
+          const sus = R.adsr[2] * 17;
+          const p = RATE[s.st === 'dec' ? R.adsr[1] : R.adsr[3]] * expDiv(s.env);
+          while (s.ecnt >= p) {
+            s.ecnt -= p;
+            if (s.st === 'dec') { if (s.env > sus) s.env--; }
+            else if (s.env > 0) s.env--;
+          }
+          if (s.st === 'dec' && s.ecnt > p) s.ecnt = 0;
+        }
+        const inc = R.freq * cps, dt = inc / 16777216;
+        const old = s.acc;
+        s.acc += inc; if (s.acc >= 16777216) s.acc -= 16777216;
+        if (mute[v] || R.wf === '-' || s.env === 0) continue;
+        const ph = s.acc / 16777216;
+        let w;
+        switch (R.wf) {
+          case 'S': w = 2 * ph - 1 - blep(ph, dt); break;
+          case 'T': w = 1 - 4 * Math.abs(ph - 0.5); break;
+          case 'P': {
+            const pw = Math.min(0.98, Math.max(0.02, R.pw / 4096));
+            w = (ph < pw ? 1 : -1) + blep(ph, dt) - blep((ph - pw + 1) % 1, dt);
+            break;
+          }
+          case 'N': {
+            let clocks = (Math.floor(s.acc / 1048576) - Math.floor(old / 1048576) + 16) % 16;
+            if (inc >= 1048576) clocks += Math.floor(inc / 16777216 * 16);
+            while (clocks-- > 0) {
+              const l = s.lfsr, fb = ((l >> 22) ^ (l >> 17)) & 1;
+              s.lfsr = ((l << 1) | fb) & 0x7FFFFF;
+            }
+            const l = s.lfsr;
+            s.nout = ((l >> 15) & 0x80) | ((l >> 14) & 0x40) | ((l >> 11) & 0x20) | ((l >> 9) & 0x10) |
+                     ((l >> 8) & 0x08) | ((l >> 5) & 0x04) | ((l >> 3) & 0x02) | ((l >> 2) & 0x01);
+            w = s.nout / 127.5 - 1; break;
+          }
+          default: w = 0;
+        }
+        const o = w * s.env / 255;
+        if (v === fvoice) filtIn += o; else direct += o;
+      }
+      let fo = 0;
+      if (fvoice >= 0) {
+        let high = 0;
+        for (let k = 0; k < 2; k++) { low += ff * band; high = filtIn - low - fq * band; band += ff * high; }
+        fo = fmode === 'LP' ? low : fmode === 'BP' ? band : high;
+      } else { low *= 0.99; band *= 0.99; }
+      const x = (direct + fo) * 0.25;
+      const y = x - dcx + 0.9995 * dcy; dcx = x; dcy = y;      // the SID's output is AC-coupled
+      buf[idx] = y;
+      const a = Math.abs(y); if (a > peak) peak = a;
+    }
+  }
+  // a hot song is scaled down whole rather than clipped: the balance inside it is the point
+  if (peak > 0.95) { const k = 0.95 / peak; for (let i = 0; i < N; i++) buf[i] *= k; }
+  return { buf, peak };
+}
+
+/* ---------- UI ---------------------------------------------------------- */
+
+const $ = id => document.getElementById(id);
+const songs = window.SONGS || [];
+let song, flat, frames, ctx, audio = null, src = null, t0 = 0, off0 = 0, playing = false;
+const mute = [false, false, false];
+let c64mode = false;
+try { c64mode = localStorage.getItem('oddballz-c64') === '1'; } catch (e) {}
+document.getElementById('c64mode').checked = c64mode;
+
+// The C64 player's frames for the same length of song: its registers, drawn
+// with the lab's own note view since the timing is the same.
+function c64Frames(song, labFrames) {
+  const mem = new Uint8Array(65536);
+  mem.set(C64.encodeSong(song).bytes, C64.SONG_BASE);
+  const p = new C64.C64Player(mem);
+  return labFrames.map(f => C64.regsToFrame(p.frame(false), f.vis));
+}
+const rowSec = () => song.speed / FRAME_HZ;
+
+function showErr(e) { $('err').textContent = e ? String(e.stack || e) : ''; }
+
+function load(i) {
+  stop();
+  off0 = 0;
+  document.querySelectorAll('#songbar .song').forEach((b, j) => b.classList.toggle('on', j === i));
+  try { localStorage.setItem('oddballz-song', songs[i].id); } catch (e) {}
+  try {
+    song = songs[i];
+    flat = flatten(song);
+    frames = play(song, flat);
+    if (c64mode) frames = c64Frames(song, frames);
+    audio = null;
+    const secs = flat.firstPassRows * rowSec(), loop = (flat.totalRows - flat.loopStartRow) * rowSec();
+    $('songinfo').textContent = song.title + ' · ' + flat.bars + ' bars · ' +
+      Math.round(60 * FRAME_HZ / (song.speed * song.rowsPerBeat)) + ' BPM · ' +
+      secs.toFixed(0) + ' s, then loops ' + loop.toFixed(0) + ' s from ' + song.loopTo;
+    const sb = $('sections'); sb.innerHTML = '';
+    flat.secSpans.filter(s => !s.pass2).forEach(s => {
+      const b = document.createElement('button');
+      b.className = 'chip'; b.textContent = s.name + ' · bar ' + flat.rowInfo[s.start].bar;
+      b.onclick = () => startAt(s.start * rowSec());
+      b.dataset.sec = s.name; sb.appendChild(b);
+    });
+    showErr('');
+  } catch (e) { showErr(e); }
+  draw(0);
+}
+
+function ensureAudio() {
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!audio) {
+    const r = render(frames, ctx.sampleRate, mute);
+    audio = ctx.createBuffer(1, r.buf.length, ctx.sampleRate);
+    audio.copyToChannel(r.buf, 0);
+    window.lastPeak = r.peak;
+  }
+}
+
+function loopBounds() { return [flat.loopStartRow * rowSec(), flat.totalRows * rowSec()]; }
+
+function position() {
+  if (!playing) return off0;
+  const [ls, le] = loopBounds();
+  let p = off0 + (ctx.currentTime - t0);
+  if (p >= le) p = ls + (p - ls) % (le - ls);
+  return p;
+}
+
+function startAt(sec) {
+  ensureAudio();
+  if (ctx.state === 'suspended') ctx.resume();
+  if (src) { src.onended = null; src.stop(); }
+  src = ctx.createBufferSource();
+  src.buffer = audio; src.loop = true;
+  [src.loopStart, src.loopEnd] = loopBounds();
+  src.connect(ctx.destination);
+  src.start(0, sec);
+  t0 = ctx.currentTime; off0 = sec; playing = true;
+  $('play').innerHTML = '&#10074;&#10074; Stop';
+  requestAnimationFrame(tick);
+}
+
+function stop() {
+  if (src) { src.onended = null; try { src.stop(); } catch (e) {} src = null; }
+  if (playing) off0 = position();
+  playing = false;
+  $('play').innerHTML = '&#9654; Play';
+}
+
+function tick() {
+  if (!playing) return;
+  draw(position());
+  requestAnimationFrame(tick);
+}
+
+$('play').onclick = () => playing ? stop() : startAt(off0);
+$('restart').onclick = () => startAt(0);
+document.querySelectorAll('label.mute input').forEach(cb => cb.onchange = () => {
+  mute[+cb.dataset.v] = !cb.checked;
+  const was = playing, p = position();
+  stop(); audio = null;
+  if (was) startAt(p); else off0 = p;
+});
+document.getElementById('c64mode').onchange = e => {
+  c64mode = e.target.checked;
+  try { localStorage.setItem('oddballz-c64', c64mode ? '1' : '0'); } catch (err) {}
+  const was = playing, p = position(), i = songs.indexOf(song);
+  load(i);
+  off0 = p;
+  if (was) startAt(p); else draw(p);
+};
+
+// one button per song; picking one while playing starts it from the top
+songs.forEach((s, i) => {
+  const b = document.createElement('button');
+  b.className = 'song'; b.textContent = s.title;
+  b.onclick = () => { const was = playing; load(i); off0 = 0; if (was) startAt(0); };
+  $('songbar').appendChild(b);
+});
+
+/* piano roll: 8 bars visible, playhead a quarter of the way in */
+const cv = $('roll'), g = cv.getContext('2d');
+const COL = ['--v1', '--v2', '--v3'].map(c => getComputedStyle(document.documentElement).getPropertyValue(c).trim());
+const DRUM = getComputedStyle(document.documentElement).getPropertyValue('--drum').trim();
+const LO = 30, HI = 90;
+
+function draw(posSec) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  if (!frames) return;
+  const spanSec = 8 * song.rowsPerBar * rowSec();
+  const pxs = W / spanSec, x0 = W * 0.25 - posSec * pxs;
+  const top = 22, bot = H - 18;
+  const y = m => bot - (m - LO) / (HI - LO) * (bot - top);
+  const fps = FRAME_HZ;
+  const f0 = Math.max(0, Math.floor((posSec - spanSec * 0.25) * fps)), f1 = Math.min(frames.length, Math.ceil((posSec + spanSec) * fps));
+  // bars and sections
+  g.font = '11px ui-sans-serif, system-ui, sans-serif';
+  const r0 = Math.floor(f0 / song.speed), r1 = Math.ceil(f1 / song.speed);
+  for (let r = r0; r < r1 && r < flat.totalRows; r++) {
+    if (r % song.rowsPerBar) continue;
+    const x = x0 + r * rowSec() * pxs, info = flat.rowInfo[r];
+    const secStart = flat.secSpans.some(s => s.start === r);
+    g.fillStyle = secStart ? '#3a3f55' : '#1d2029';
+    g.fillRect(Math.round(x), top - 4, 1, bot - top + 4);
+    g.fillStyle = '#8b8fa3';
+    g.fillText(String(info.bar), x + 3, bot + 13);
+    if (secStart) { g.fillStyle = '#e6e6ec'; g.fillText(info.sec, x + 3, 13); }
+  }
+  // octave lines
+  g.fillStyle = '#15171f';
+  for (let m = 36; m < HI; m += 12) g.fillRect(0, Math.round(y(m)), W, 1);
+  // notes, drawn frame by frame from what the player actually played
+  for (let v = 2; v >= 0; v--) {
+    for (let f = f0; f < f1; f++) {
+      const s = frames[f].vis[v];
+      if (!s) continue;
+      const x = x0 + f / fps * pxs, w = Math.max(1, pxs / fps + 0.5);
+      if (s.drum) {
+        if (v !== 1) continue;
+        const ev = f % song.speed === 0 ? flat.voices[v][f / song.speed].ev : null;
+        if (ev && ev.drum) { g.fillStyle = DRUM; g.fillRect(x, bot - 10, 3, 8); }
+        continue;
+      }
+      g.globalAlpha = s.gate ? 0.95 : 0.25;
+      g.fillStyle = COL[v];
+      const h = v === 0 ? 6 : 4;
+      g.fillRect(x, y(s.pitch) - h / 2, w, h);
+      if (s.arp) {
+        g.globalAlpha = s.gate ? 0.35 : 0.1;
+        for (const a of s.arp) if (a) g.fillRect(x, y(s.pitch + a) - 1.5, w, 3);
+      }
+      g.globalAlpha = 1;
+    }
+  }
+  // playhead
+  g.fillStyle = '#7ee787'; g.fillRect(Math.round(W * 0.25), top - 6, 2, bot - top + 8);
+  // position readout and the current section chip
+  const row = Math.min(flat.totalRows - 1, Math.floor(posSec / rowSec()));
+  const info = flat.rowInfo[row];
+  const beat = Math.floor((row % song.rowsPerBar) / song.rowsPerBeat) + 1;
+  $('pos').innerHTML = '<b>' + info.sec + '</b> · bar <b>' + info.bar + '</b> beat ' + beat;
+  document.querySelectorAll('#sections .chip').forEach(c => c.classList.toggle('on', c.dataset.sec === info.sec));
+  cv._map = { x0, pxs };
+}
+
+cv.onclick = e => {
+  if (!cv._map) return;
+  const r = cv.getBoundingClientRect();
+  const sec = Math.max(0, (e.clientX - r.left - cv._map.x0) / cv._map.pxs);
+  const rowAligned = Math.floor(sec / rowSec() / song.rowsPerBeat) * song.rowsPerBeat * rowSec();
+  if (playing) startAt(rowAligned); else { off0 = rowAligned; draw(off0); }
+};
+window.addEventListener('resize', () => draw(position()));
+
+if (songs.length) {
+  let last = null;
+  try { last = localStorage.getItem('oddballz-song'); } catch (e) {}
+  load(Math.max(0, songs.findIndex(s => s.id === last)));
+} else showErr('No songs loaded.');
+</script>
+</body>
+</html>
